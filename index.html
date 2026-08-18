@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kabuti Grid — Network Infrastructure Monitoring</title>
+<meta name="description" content="Kabuti Grid provides real-time infrastructure monitoring, uptime tracking, and network health analytics for distributed systems.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#060e16;
+    --surface:#0c1c28;
+    --surface-2:#102534;
+    --line:#16303f;
+    --teal:#29e0c9;
+    --teal-dim:#1a4a45;
+    --orange:#f5a524;
+    --text:#e7f3f1;
+    --text-muted:#6f8894;
+    --radius:14px;
+  }
+
+  *{box-sizing:border-box; margin:0; padding:0;}
+
+  html{scroll-behavior:smooth;}
+
+  body{
+    background:
+      radial-gradient(ellipse 900px 500px at 15% -10%, rgba(41,224,201,0.08), transparent 60%),
+      radial-gradient(ellipse 700px 500px at 100% 10%, rgba(245,165,36,0.05), transparent 60%),
+      var(--bg);
+    color:var(--text);
+    font-family:'Inter', -apple-system, sans-serif;
+    line-height:1.5;
+    min-height:100vh;
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important;}
+  }
+
+  a{color:inherit; text-decoration:none;}
+
+  .wrap{max-width:1080px; margin:0 auto; padding:0 24px;}
+
+  /* Nav */
+  nav{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:28px 0;
+  }
+  .brand{
+    display:flex; align-items:center; gap:10px;
+    font-family:'Space Grotesk', sans-serif;
+    font-weight:600; font-size:1.05rem;
+    letter-spacing:0.01em;
+  }
+  .brand-mark{
+    width:28px; height:28px; border-radius:8px;
+    background:linear-gradient(135deg, var(--teal), #158f80);
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 0 18px rgba(41,224,201,0.45);
+  }
+  .brand-mark svg{width:15px; height:15px;}
+  nav .links{display:flex; gap:32px; font-size:0.9rem; color:var(--text-muted);}
+  nav .links a:hover{color:var(--text);}
+  .status-pill{
+    display:flex; align-items:center; gap:8px;
+    font-family:'JetBrains Mono', monospace;
+    font-size:0.78rem; color:var(--teal);
+    background:rgba(41,224,201,0.07);
+    border:1px solid rgba(41,224,201,0.25);
+    padding:6px 12px; border-radius:100px;
+  }
+  .dot{width:6px; height:6px; border-radius:50%; background:var(--teal); box-shadow:0 0 8px var(--teal); animation:pulse 2.4s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;} 50%{opacity:0.35;}}
+
+  /* Hero */
+  .hero{
+    display:grid;
+    grid-template-columns:1.15fr 0.85fr;
+    gap:56px;
+    align-items:center;
+    padding:56px 0 88px;
+  }
+  .eyebrow{
+    font-family:'JetBrains Mono', monospace;
+    font-size:0.78rem; color:var(--orange);
+    letter-spacing:0.12em; text-transform:uppercase;
+    margin-bottom:18px; display:block;
+  }
+  h1{
+    font-family:'Space Grotesk', sans-serif;
+    font-size:clamp(2.1rem, 4.4vw, 3.4rem);
+    font-weight:700; letter-spacing:-0.02em;
+    line-height:1.08;
+    margin-bottom:20px;
+  }
+  h1 .accent{color:var(--teal);}
+  .lede{color:var(--text-muted); font-size:1.05rem; max-width:46ch; margin-bottom:32px;}
+  .cta-row{display:flex; gap:14px; flex-wrap:wrap;}
+  .btn{
+    font-family:'Inter', sans-serif; font-weight:600; font-size:0.92rem;
+    padding:13px 24px; border-radius:10px;
+    display:inline-flex; align-items:center; gap:8px;
+  }
+  .btn-primary{
+    background:var(--teal); color:#04211d;
+    box-shadow:0 0 0 rgba(41,224,201,0); transition:box-shadow 0.25s ease, transform 0.15s ease;
+  }
+  .btn-primary:hover{box-shadow:0 0 28px rgba(41,224,201,0.35); transform:translateY(-1px);}
+  .btn-ghost{
+    border:1px solid var(--line); color:var(--text);
+    transition:border-color 0.2s ease;
+  }
+  .btn-ghost:hover{border-color:var(--teal);}
+
+  /* Signature ring */
+  .ring-card{
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:20px;
+    padding:32px;
+    display:flex; flex-direction:column; align-items:center; gap:20px;
+  }
+  .ring-label{
+    font-family:'JetBrains Mono', monospace;
+    font-size:0.72rem; color:var(--text-muted);
+    letter-spacing:0.12em; text-transform:uppercase;
+  }
+  .ring{
+    position:relative; width:190px; height:190px;
+  }
+  .ring svg{transform:rotate(-90deg); width:100%; height:100%;}
+  .ring-track{fill:none; stroke:var(--line); stroke-width:10;}
+  .ring-fill{
+    fill:none; stroke:var(--teal); stroke-width:10; stroke-linecap:round;
+    stroke-dasharray:534; stroke-dashoffset:11;
+    filter:drop-shadow(0 0 8px rgba(41,224,201,0.55));
+    animation:draw 1.6s cubic-bezier(0.4,0,0.2,1) both;
+  }
+  @keyframes draw{from{stroke-dashoffset:534;} to{stroke-dashoffset:11;}}
+  .ring-center{
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+  }
+  .ring-pct{font-family:'Space Grotesk', sans-serif; font-size:2.4rem; font-weight:700;}
+  .ring-sub{font-family:'JetBrains Mono', monospace; font-size:0.7rem; color:var(--text-muted); margin-top:4px;}
+  .ring-meta{
+    display:flex; gap:24px; font-family:'JetBrains Mono', monospace; font-size:0.78rem;
+  }
+  .ring-meta div{text-align:center;}
+  .ring-meta .n{color:var(--orange); font-size:0.95rem; font-weight:600;}
+  .ring-meta .l{color:var(--text-muted); font-size:0.68rem; margin-top:2px;}
+
+  /* Stat cards */
+  .stats{
+    display:grid; grid-template-columns:repeat(4, 1fr); gap:16px;
+    padding:8px 0 72px;
+  }
+  .stat{
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:22px 20px;
+  }
+  .stat .k{
+    font-family:'Space Grotesk', sans-serif; font-size:1.7rem; font-weight:600;
+  }
+  .stat .k .u{font-size:1rem; color:var(--teal); margin-left:2px;}
+  .stat .l{color:var(--text-muted); font-size:0.82rem; margin-top:6px;}
+
+  /* Section */
+  .section{padding:64px 0; border-top:1px solid var(--line);}
+  .section-head{max-width:52ch; margin-bottom:44px;}
+  .section-head .eyebrow{margin-bottom:12px;}
+  .section-head h2{
+    font-family:'Space Grotesk', sans-serif; font-size:1.9rem; font-weight:700;
+    letter-spacing:-0.01em; margin-bottom:12px;
+  }
+  .section-head p{color:var(--text-muted);}
+
+  .grid3{display:grid; grid-template-columns:repeat(3, 1fr); gap:20px;}
+  .card{
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:26px;
+    transition:border-color 0.2s ease, transform 0.2s ease;
+  }
+  .card:hover{border-color:var(--teal-dim); transform:translateY(-2px);}
+  .card .icon{
+    width:38px; height:38px; border-radius:9px;
+    background:var(--surface-2); border:1px solid var(--line);
+    display:flex; align-items:center; justify-content:center;
+    margin-bottom:16px; color:var(--teal);
+  }
+  .card h3{font-family:'Space Grotesk', sans-serif; font-size:1.05rem; margin-bottom:8px;}
+  .card p{color:var(--text-muted); font-size:0.9rem;}
+
+  .contact-wrap{display:grid; grid-template-columns:1fr 1fr; gap:40px;}
+  .contact-info .row{display:flex; gap:12px; margin-bottom:18px; color:var(--text-muted); font-size:0.92rem;}
+  .contact-info .row .icon{
+    width:34px; height:34px; border-radius:8px; flex-shrink:0;
+    background:var(--surface); border:1px solid var(--line);
+    display:flex; align-items:center; justify-content:center; color:var(--teal);
+  }
+  .contact-info .row div p{margin:0; color:var(--text-muted); font-size:0.88rem;}
+  .contact-info .row div .label{color:var(--text); font-weight:600; font-size:0.9rem; margin-bottom:2px;}
+  form.card{display:flex; flex-direction:column; gap:14px;}
+  form.card label{font-size:0.8rem; color:var(--text-muted); margin-bottom:6px; display:block;}
+  form.card input, form.card textarea{
+    width:100%; background:var(--surface-2); border:1px solid var(--line);
+    border-radius:8px; padding:10px 12px; color:var(--text);
+    font-family:'Inter', sans-serif; font-size:0.9rem;
+  }
+  form.card input:focus, form.card textarea:focus{outline:none; border-color:var(--teal);}
+  form.card textarea{resize:vertical; min-height:90px;}
+
+  .pricing-grid{display:grid; grid-template-columns:repeat(3, 1fr); gap:20px;}
+  .price-card{
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+    padding:28px; display:flex; flex-direction:column;
+  }
+  .price-card.featured{border-color:var(--teal); box-shadow:0 0 32px rgba(41,224,201,0.12);}
+  .price-card .tier{font-family:'JetBrains Mono', monospace; font-size:0.75rem; color:var(--orange); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:10px;}
+  .price-card .amount{font-family:'Space Grotesk', sans-serif; font-size:2rem; font-weight:700; margin-bottom:4px;}
+  .price-card .amount span{font-size:0.9rem; color:var(--text-muted); font-weight:400;}
+  .price-card .desc{color:var(--text-muted); font-size:0.85rem; margin-bottom:20px;}
+  .price-card ul{list-style:none; display:flex; flex-direction:column; gap:10px; margin-bottom:24px; flex:1;}
+  .price-card li{display:flex; gap:8px; align-items:flex-start; font-size:0.86rem; color:var(--text-muted);}
+  .price-card li::before{content:"✓"; color:var(--teal); font-weight:700; flex-shrink:0;}
+
+  .testi-grid{display:grid; grid-template-columns:repeat(3, 1fr); gap:20px;}
+  .testi{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:24px; display:flex; flex-direction:column; gap:16px;}
+  .testi p{color:var(--text); font-size:0.92rem; line-height:1.6;}
+  .testi .who{display:flex; align-items:center; gap:10px;}
+  .testi .avatar{width:34px; height:34px; border-radius:50%; background:linear-gradient(135deg, var(--teal), #158f80); flex-shrink:0;}
+  .testi .name{font-size:0.85rem; font-weight:600;}
+  .testi .role{font-size:0.78rem; color:var(--text-muted);}
+
+  .integ-grid{display:grid; grid-template-columns:repeat(4, 1fr); gap:16px;}
+  .integ{
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+    padding:20px; display:flex; align-items:center; gap:12px; font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:0.92rem;
+  }
+  .integ .dot2{width:8px; height:8px; border-radius:50%; background:var(--teal); flex-shrink:0;}
+
+  .faq-item{border-bottom:1px solid var(--line);}
+  .faq-item summary{
+    padding:20px 0; cursor:pointer; font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:0.98rem;
+    display:flex; justify-content:space-between; align-items:center; list-style:none;
+  }
+  .faq-item summary::-webkit-details-marker{display:none;}
+  .faq-item summary::after{content:"+"; color:var(--teal); font-size:1.3rem; font-weight:400;}
+  .faq-item[open] summary::after{content:"−";}
+  .faq-item p{color:var(--text-muted); font-size:0.9rem; padding-bottom:20px; max-width:60ch;}
+
+  @media (max-width:860px){
+    .pricing-grid, .testi-grid{grid-template-columns:1fr;}
+    .integ-grid{grid-template-columns:repeat(2,1fr);}
+  }
+
+  footer{
+    border-top:1px solid var(--line);
+    padding:32px 0 48px;
+    display:flex; justify-content:space-between; align-items:center;
+    flex-wrap:wrap; gap:12px;
+    color:var(--text-muted); font-size:0.82rem;
+  }
+  footer .links{display:flex; gap:22px;}
+  footer a:hover{color:var(--text);}
+
+  @media (max-width:860px){
+    .hero{grid-template-columns:1fr; gap:40px;}
+    .stats{grid-template-columns:repeat(2,1fr);}
+    .grid3{grid-template-columns:1fr;}
+    nav .links{display:none;}
+  }
+
+  :focus-visible{outline:2px solid var(--teal); outline-offset:3px; border-radius:4px;}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <div class="brand">
+      <span class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M4 12c0-4.4 3.6-8 8-8s8 3.6 8 8" stroke="#04211d" stroke-width="2.4" stroke-linecap="round"/><circle cx="12" cy="18" r="2" fill="#04211d"/></svg>
+      </span>
+      Kabuti Grid
+    </div>
+    <div class="links">
+      <a href="#platform">Platform</a>
+      <a href="#services">Services</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#contact">Contact</a>
+    </div>
+    <div class="status-pill"><span class="dot"></span> All systems operational</div>
+  </nav>
+
+  <section class="hero">
+    <div>
+      <span class="eyebrow">Infrastructure monitoring</span>
+      <h1>Know the moment<br>your network <span class="accent">breathes wrong.</span></h1>
+      <p class="lede">Kabuti Grid watches latency, throughput, and uptime across every node you run — so incidents get caught in seconds, not support tickets.</p>
+      <div class="cta-row">
+        <a href="#platform" class="btn btn-primary">View live status</a>
+        <a href="#regions" class="btn btn-ghost">See coverage map</a>
+      </div>
+    </div>
+
+    <div class="ring-card">
+      <span class="ring-label">Network Health — 30d</span>
+      <div class="ring">
+        <svg viewBox="0 0 200 200">
+          <circle class="ring-track" cx="100" cy="100" r="85"/>
+          <circle class="ring-fill" cx="100" cy="100" r="85"/>
+        </svg>
+        <div class="ring-center">
+          <div class="ring-pct">99.98%</div>
+          <div class="ring-sub">UPTIME</div>
+        </div>
+      </div>
+      <div class="ring-meta">
+        <div><div class="n">14 ms</div><div class="l">AVG LATENCY</div></div>
+        <div><div class="n">6</div><div class="l">REGIONS</div></div>
+        <div><div class="n">2</div><div class="l">INCIDENTS/YR</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="stats" id="status">
+    <div class="stat"><div class="k">312<span class="u">TB</span></div><div class="l">Traffic analyzed this month</div></div>
+    <div class="stat"><div class="k">99.98<span class="u">%</span></div><div class="l">Rolling 30-day uptime</div></div>
+    <div class="stat"><div class="k">6</div><div class="l">Monitored regions</div></div>
+    <div class="stat"><div class="k">&lt;30<span class="u">s</span></div><div class="l">Median alert time</div></div>
+  </section>
+
+  <section class="section" id="platform">
+    <div class="section-head">
+      <span class="eyebrow">Platform</span>
+      <h2>Built for people who get paged at 3am</h2>
+      <p>Three things Kabuti Grid does well, and does quietly, so you don't have to think about it until you need to.</p>
+    </div>
+    <div class="grid3">
+      <div class="card">
+        <div class="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+        <h3>Realtime probes</h3>
+        <p>TCP and latency checks every few seconds from independent vantage points, so a blip in one region never hides behind an average.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/></svg></div>
+        <h3>Regional coverage</h3>
+        <p>Nodes across six regions give you a real picture of how your infrastructure behaves for the people actually using it.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 2 3 7v6c0 5 4 8 9 9 5-1 9-4 9-9V7l-9-5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+        <h3>Quiet alerting</h3>
+        <p>One notification when something's actually wrong. No duplicate pages, no noise dashboards nobody reads.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <span class="eyebrow">Integrations</span>
+      <h2>Fits into the stack you already have</h2>
+      <p>Send alerts where your team already looks, and pull data from what you already run.</p>
+    </div>
+    <div class="integ-grid">
+      <div class="integ"><span class="dot2"></span>Slack</div>
+      <div class="integ"><span class="dot2"></span>PagerDuty</div>
+      <div class="integ"><span class="dot2"></span>Datadog</div>
+      <div class="integ"><span class="dot2"></span>Grafana</div>
+      <div class="integ"><span class="dot2"></span>Webhooks</div>
+      <div class="integ"><span class="dot2"></span>Discord</div>
+      <div class="integ"><span class="dot2"></span>Telegram</div>
+      <div class="integ"><span class="dot2"></span>REST API</div>
+    </div>
+  </section>
+
+  <section class="section" id="regions">
+    <div class="section-head">
+      <span class="eyebrow">Coverage</span>
+      <h2>Six regions, one view</h2>
+      <p>Every probe reports back to the same pane, whichever region it's watching.</p>
+    </div>
+    <div class="grid3">
+      <div class="card"><h3>EU-West</h3><p style="margin-top:4px">12 ms median · operational</p></div>
+      <div class="card"><h3>EU-North</h3><p style="margin-top:4px">18 ms median · operational</p></div>
+      <div class="card"><h3>EU-Central</h3><p style="margin-top:4px">9 ms median · operational</p></div>
+    </div>
+  </section>
+
+  <section class="section" id="services">
+    <div class="section-head">
+      <span class="eyebrow">Services</span>
+      <h2>What we run for you</h2>
+      <p>Beyond monitoring, Kabuti Grid teams build and maintain the connective layer between your infrastructure and the internet.</p>
+    </div>
+    <div class="grid3">
+      <div class="card">
+        <div class="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" stroke="currentColor" stroke-width="1.8"/><path d="M8 21h8M12 17v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h3>API Integration</h3>
+        <p>We connect your monitoring, billing, and DNS layers into a single set of endpoints, so your systems talk to each other without glue scripts.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="7" rx="2" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="13" width="18" height="7" rx="2" stroke="currentColor" stroke-width="1.8"/></svg></div>
+        <h3>Enterprise Infrastructure</h3>
+        <p>Design and management of resilient, distributed server infrastructure — load balancing, failover, and secure network paths built in from day one.</p>
+      </div>
+      <div class="card">
+        <div class="icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 19V10M12 19V5M20 19v-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h3>Data Analytics</h3>
+        <p>Turn raw traffic and uptime logs into readable trends, so your team spots slow drift before it becomes an incident.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="pricing">
+    <div class="section-head">
+      <span class="eyebrow">Pricing</span>
+      <h2>Simple tiers, no surprise overages</h2>
+      <p>Start free, scale to enterprise coverage when you actually need it.</p>
+    </div>
+    <div class="pricing-grid">
+      <div class="price-card">
+        <div class="tier">Starter</div>
+        <div class="amount">$0<span>/mo</span></div>
+        <div class="desc">For small projects and side servers.</div>
+        <ul>
+          <li>Up to 5 monitored endpoints</li>
+          <li>5-minute check interval</li>
+          <li>Email alerts</li>
+          <li>7-day history</li>
+        </ul>
+        <a href="#contact" class="btn btn-ghost">Get started</a>
+      </div>
+      <div class="price-card featured">
+        <div class="tier">Team</div>
+        <div class="amount">$29<span>/mo</span></div>
+        <div class="desc">For teams running production infrastructure.</div>
+        <ul>
+          <li>Up to 50 monitored endpoints</li>
+          <li>30-second check interval</li>
+          <li>Slack, Discord, Telegram alerts</li>
+          <li>90-day history</li>
+          <li>6 monitoring regions</li>
+        </ul>
+        <a href="#contact" class="btn btn-primary">Start free trial</a>
+      </div>
+      <div class="price-card">
+        <div class="tier">Enterprise</div>
+        <div class="amount">Custom</div>
+        <div class="desc">For large fleets with custom SLAs.</div>
+        <ul>
+          <li>Unlimited endpoints</li>
+          <li>Sub-10s check interval</li>
+          <li>Dedicated support channel</li>
+          <li>Custom data retention</li>
+          <li>SSO &amp; audit logs</li>
+        </ul>
+        <a href="#contact" class="btn btn-ghost">Talk to us</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <span class="eyebrow">Testimonials</span>
+      <h2>Teams that stopped guessing</h2>
+    </div>
+    <div class="testi-grid">
+      <div class="testi">
+        <p>"We caught a regional outage before our own users noticed. That alone paid for a year of the Team plan."</p>
+        <div class="who"><div class="avatar"></div><div><div class="name">J. Mwangi</div><div class="role">Infrastructure Lead</div></div></div>
+      </div>
+      <div class="testi">
+        <p>"Setup took ten minutes. The alerting is quiet enough that we actually trust it when it goes off."</p>
+        <div class="who"><div class="avatar"></div><div><div class="name">A. Kariuki</div><div class="role">DevOps Engineer</div></div></div>
+      </div>
+      <div class="testi">
+        <p>"Moved off three separate tools onto one dashboard. Fewer tabs, fewer missed alerts."</p>
+        <div class="who"><div class="avatar"></div><div><div class="name">S. Otieno</div><div class="role">Founder, small SaaS</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="contact">
+    <div class="section-head">
+      <span class="eyebrow">Contact</span>
+      <h2>Talk to the team</h2>
+      <p>Questions about coverage, pricing, or onboarding an existing setup — reach out and we'll follow up within one business day.</p>
+    </div>
+    <div class="contact-wrap" style="grid-template-columns:1fr; max-width:520px;">
+      <form class="card" onsubmit="event.preventDefault(); alert('Asante! Tutawasiliana nawe hivi karibuni.');">
+        <div>
+          <label for="name">Name</label>
+          <input id="name" type="text" required placeholder="Jina lako">
+        </div>
+        <div>
+          <label for="email">Email</label>
+          <input id="email" type="email" required placeholder="wewe@kampuni.com">
+        </div>
+        <div>
+          <label for="message">Message</label>
+          <textarea id="message" required placeholder="Tuambie unahitaji nini..."></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary" style="align-self:flex-start;">Send message</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <span class="eyebrow">FAQ</span>
+      <h2>Common questions</h2>
+    </div>
+    <div>
+      <details class="faq-item" open>
+        <summary>How fast do you detect an outage?</summary>
+        <p>Probes run every 30 seconds on the Team plan and below 10 seconds on Enterprise. Median alert time across all customers is under 30 seconds from the first failed check.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Can I monitor internal, non-public endpoints?</summary>
+        <p>Yes — install a lightweight local agent to expose internal services to Kabuti Grid without opening them publicly.</p>
+      </details>
+      <details class="faq-item">
+        <summary>What happens if a region itself goes down?</summary>
+        <p>Checks are cross-verified from at least two other regions before an alert fires, so a single region issue never triggers a false page.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Do you offer a free trial on paid plans?</summary>
+        <p>Team plan includes a 14-day free trial, no card required. Enterprise trials are scoped with your team during onboarding.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Can I cancel anytime?</summary>
+        <p>Yes, monthly plans can be cancelled anytime from your dashboard — no lock-in contracts on Starter or Team.</p>
+      </details>
+    </div>
+  </section>
+
+  <footer>
+    <div>© 2026 Kabuti Grid. All systems nominal.</div>
+    <div class="links">
+      <a href="#status">Status</a>
+      <a href="#platform">Platform</a>
+      <a href="#services">Services</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#contact">Contact</a>
+      <a href="#privacy">Privacy Policy</a>
+      <a href="#terms">Terms of Service</a>
+    </div>
+  </footer>
+</div>
+
+</body>
+</html>
