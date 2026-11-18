@@ -12,7 +12,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="5.1.0"
+readonly VERSION="5.2.1"
 readonly REPO_RAW="https://raw.githubusercontent.com/Kabut27/caddy/main"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly CADDY_ENV="/etc/caddy/caddy.env"
@@ -92,6 +92,9 @@ USE_WILDCARD="false"
 CF_API_TOKEN=""
 PLAIN_HTTP="false"          # also serve the same routes over plain HTTP on :80 (no TLS)
 NEED_RESTART="false"
+ENABLE_MIXED_L4="false"     # SOCKS5 / HTTP / Mixed proxy on :443 via caddy-l4
+MIXED_PORT="10808"          # 3x-ui mixed/socks/http inbound (127.0.0.1)
+CADDY_HTTPS_PORT="8443"     # internal loopback HTTPS port, used only when ENABLE_MIXED_L4=true
 
 save_state() {
   local i
@@ -105,6 +108,9 @@ save_state() {
     printf 'USE_WILDCARD=%q\n' "$USE_WILDCARD"
     printf 'CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
     printf 'PLAIN_HTTP=%q\n' "$PLAIN_HTTP"
+    printf 'ENABLE_MIXED_L4=%q\n' "$ENABLE_MIXED_L4"
+    printf 'MIXED_PORT=%q\n' "$MIXED_PORT"
+    printf 'CADDY_HTTPS_PORT=%q\n' "$CADDY_HTTPS_PORT"
   } > "$CONF_FILE"
   chmod 600 "$CONF_FILE"
   : > "$LOC_FILE"
@@ -254,6 +260,29 @@ ask_email() {
   done
 }
 
+configure_mixed() {
+  local ans def="n"
+  [[ "$ENABLE_MIXED_L4" == "true" ]] && def="y"
+  info "Caddy (caddy-l4) can also accept SOCKS5 / HTTP / Mixed proxy clients on port 443, detected by protocol."
+  info "The website then moves to an internal loopback port. Note: SOCKS5/HTTP auth is NOT encrypted."
+  if confirm "Enable SOCKS5 / HTTP / Mixed on port 443?" "$def"; then
+    ENABLE_MIXED_L4="true"
+    while true; do
+      ans="$(ask "3x-ui Mixed/SOCKS/HTTP inbound port (127.0.0.1)" "$MIXED_PORT")"
+      if valid_port "$ans" && [[ "$ans" != "80" && "$ans" != "443" ]]; then MIXED_PORT="$ans"; break; fi
+      err "Invalid port (not 80/443)."
+    done
+    while true; do
+      ans="$(ask "Caddy internal HTTPS port (127.0.0.1 only)" "$CADDY_HTTPS_PORT")"
+      if valid_port "$ans" && [[ "$ans" != "80" && "$ans" != "443" && "$ans" != "$MIXED_PORT" ]]; then CADDY_HTTPS_PORT="$ans"; break; fi
+      err "Invalid port (not 80/443, and different from ${MIXED_PORT})."
+    done
+  else
+    ENABLE_MIXED_L4="false"
+  fi
+  NEED_RESTART="true"   # listeners change → restart instead of reload
+}
+
 gather_full() {
   local ans
 
@@ -271,6 +300,7 @@ gather_full() {
   done
 
   if confirm "Also accept plain HTTP on port 80 for proxy clients (no TLS)?" "n"; then PLAIN_HTTP="true"; else PLAIN_HTTP="false"; fi
+  configure_mixed
 
   step "3/4  Routes (ws · httpupgrade · grpc · xhttp · panel · sub)"
   LOC_KEYS=(); LOC_PORTS=(); LOC_TYPES=()
@@ -306,24 +336,43 @@ free_ports() {
   fi
 }
 
-# Prebuilt Caddy with plugins from the official download service (no Go needed).
-#   caddy-dns/cloudflare → wildcard certificates (DNS-01)
-#   caddy-l4             → layer4 (TCP/UDP) proxying; not used by the config below, kept for later
+# Plugins this setup actually needs (Go module paths).
+needed_plugins() {
+  local out=""
+  if [[ "$USE_WILDCARD" == "true" ]]; then out+=" github.com/caddy-dns/cloudflare"; fi
+  if [[ "$ENABLE_MIXED_L4" == "true" ]]; then out+=" github.com/mholt/caddy-l4"; fi
+  printf '%s' "$out"
+}
+
+# Does binary $1 contain every plugin we need?
+binary_has_plugins() {
+  local mods
+  mods="$("$1" list-modules 2>/dev/null || true)"
+  [[ "$USE_WILDCARD" != "true" ]] || grep -q 'dns.providers.cloudflare' <<< "$mods" || return 1
+  [[ "$ENABLE_MIXED_L4" != "true" ]] || grep -q 'layer4' <<< "$mods" || return 1
+  return 0
+}
+
+# 1) Try Caddy's prebuilt download service (fast, but its build server sometimes
+#    answers HTTP 400 for plugin combinations it cannot compile).
 fetch_custom_caddy() {
-  local arch url tmp
+  local arch pkgs="" p url tmp code
   case "$(uname -m)" in
     x86_64|amd64)  arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
     *) return 1 ;;
   esac
-  url="https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/cloudflare&p=github.com/mholt/caddy-l4"
+  for p in $(needed_plugins); do pkgs+="&p=${p}"; done
+  [[ -n "$pkgs" ]] || return 1
+  url="https://caddyserver.com/api/download?os=linux&arch=${arch}${pkgs}"
   tmp="$(mktemp)"
-  if curl -fsSL "$url" -o "$tmp" && chmod +x "$tmp" \
-     && "$tmp" list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
+  code="$(curl -sSL --max-time 180 -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  if [[ "$code" == "200" ]] && chmod +x "$tmp" && binary_has_plugins "$tmp"; then
     install_custom_binary "$tmp"
     rm -f "$tmp"
     return 0
   fi
+  warn "Caddy's download service could not build the plugins (HTTP ${code:-?})."
   rm -f "$tmp"
   return 1
 }
@@ -339,24 +388,36 @@ install_custom_binary() {
   update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.custom 50 >/dev/null
 }
 
-build_with_xcaddy() {
-  local tmp_bin
-  warn "Prebuilt download failed — falling back to xcaddy (needs a recent Go)."
-  if ! command -v xcaddy >/dev/null 2>&1; then
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/gpg.key' \
-      | gpg --dearmor --yes -o /usr/share/keyrings/caddy-xcaddy-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/debian.deb.txt' \
-      -o /etc/apt/sources.list.d/caddy-xcaddy.list
-    apt-get update -qq
-    apt-get install -y -qq xcaddy golang-go >/dev/null
+# apt's golang-go is far too old for current Caddy → install the official Go.
+ensure_go() {
+  local arch gover
+  case "$(uname -m)" in
+    x86_64|amd64)  arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) die "Unsupported CPU for the Go toolchain: $(uname -m)" ;;
+  esac
+  if [[ ! -x /usr/local/go/bin/go ]]; then
+    info "Installing a current Go toolchain (needed to build Caddy)…"
+    gover="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)"
+    [[ "$gover" == go* ]] || die "Could not determine the latest Go version."
+    curl -fsSL "https://go.dev/dl/${gover}.linux-${arch}.tar.gz" | tar -C /usr/local -xz
   fi
+  export PATH="/usr/local/go/bin:${PATH}"
+}
+
+# 2) Fallback: compile it ourselves with xcaddy (takes a few minutes, ~1 GB RAM).
+build_with_xcaddy() {
+  local tmp_bin p
+  local -a args=()
+  for p in $(needed_plugins); do args+=(--with "$p"); done
+  (( ${#args[@]} > 0 )) || return 0
+  warn "Building Caddy with xcaddy — this takes a few minutes. If it ends with 'signal: killed', add swap (low RAM)."
+  ensure_go
+  export HOME="${HOME:-/root}" GOPATH="${GOPATH:-/root/go}"
+  go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest || die "Could not install xcaddy."
   tmp_bin="$(mktemp -d)"
-  (
-    cd "$tmp_bin"
-    xcaddy build \
-      --with github.com/caddy-dns/cloudflare \
-      --with github.com/mholt/caddy-l4
-  )
+  ( cd "$tmp_bin" && "$(go env GOPATH)/bin/xcaddy" build "${args[@]}" ) || die "xcaddy build failed."
+  binary_has_plugins "${tmp_bin}/caddy" || die "xcaddy built a binary without the required plugins."
   install_custom_binary "${tmp_bin}/caddy"
   rm -rf "$tmp_bin"
 }
@@ -376,10 +437,13 @@ install_caddy() {
     apt-get install -y -qq caddy >/dev/null
   fi
 
-  if [[ "$USE_WILDCARD" == "true" ]] && ! caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
-    info "Getting Caddy with cloudflare-dns (+ caddy-l4) plugins…"
+  local need_build=false
+  if [[ "$USE_WILDCARD" == "true" ]] && ! caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then need_build=true; fi
+  if [[ "$ENABLE_MIXED_L4" == "true" ]] && ! caddy list-modules 2>/dev/null | grep -q 'layer4'; then need_build=true; fi
+  if [[ "$need_build" == "true" ]]; then
+    info "Getting Caddy with cloudflare-dns + caddy-l4 plugins…"
     if ! fetch_custom_caddy; then build_with_xcaddy; fi
-    ok "Caddy ready with Cloudflare DNS module."
+    ok "Caddy ready with Cloudflare DNS + Layer4 modules."
   else
     ok "Caddy binary ready ($(caddy version | awk '{print $1}'))."
   fi
@@ -411,8 +475,8 @@ open_firewall() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow 80/tcp  >/dev/null
     ufw allow 443/tcp >/dev/null
-    ufw allow 443/udp >/dev/null   # HTTP/3 (QUIC)
-    ok "ufw: opened 80/tcp, 443/tcp, 443/udp."
+    if [[ "$ENABLE_MIXED_L4" != "true" ]]; then ufw allow 443/udp >/dev/null; fi   # HTTP/3 (QUIC)
+    ok "ufw: opened 80/tcp, 443/tcp$([[ "$ENABLE_MIXED_L4" != "true" ]] && echo ", 443/udp")."
   fi
 }
 
@@ -523,10 +587,42 @@ render_caddyfile() {
   printf '# Generated by caddy.sh v%s on %s\n' "$VERSION" "$(date '+%F %T')"
   printf '# Manual edits are overwritten — re-run the script to change settings.\n\n'
 
-  if [[ -n "$EMAIL" || "$PLAIN_HTTP" == "true" ]]; then
+  if [[ -n "$EMAIL" || "$PLAIN_HTTP" == "true" || "$ENABLE_MIXED_L4" == "true" ]]; then
     echo "{"
     if [[ -n "$EMAIL" ]]; then echo "    email ${EMAIL}"; fi
-    if [[ "$PLAIN_HTTP" == "true" ]]; then echo "    auto_https disable_redirects"; fi
+    if [[ "$PLAIN_HTTP" == "true" || "$ENABLE_MIXED_L4" == "true" ]]; then echo "    auto_https disable_redirects"; fi
+    if [[ "$ENABLE_MIXED_L4" == "true" ]]; then
+      echo "    http_port 80"
+      echo "    https_port ${CADDY_HTTPS_PORT}"
+      echo "    servers 127.0.0.1:${CADDY_HTTPS_PORT} {"
+      echo "        protocols h1 h2"
+      echo "        listener_wrappers {"
+      echo "            proxy_protocol {"
+      echo "                timeout 5s"
+      echo "                allow 127.0.0.1/32"
+      echo "            }"
+      echo "            tls"
+      echo "        }"
+      echo "    }"
+      echo "    layer4 {"
+      echo "        :443 {"
+      echo "            @socks5 socks5"
+      echo "            route @socks5 {"
+      echo "                proxy 127.0.0.1:${MIXED_PORT}"
+      echo "            }"
+      echo "            @http_proxy http"
+      echo "            route @http_proxy {"
+      echo "                proxy 127.0.0.1:${MIXED_PORT}"
+      echo "            }"
+      echo "            route {"
+      echo "                proxy {"
+      echo "                    upstream 127.0.0.1:${CADDY_HTTPS_PORT}"
+      echo "                    proxy_protocol v1"
+      echo "                }"
+      echo "            }"
+      echo "        }"
+      echo "    }"
+    fi
     echo "}"
     echo
   fi
@@ -582,6 +678,7 @@ render_caddyfile() {
   echo
 
   echo "${https} {"
+  if [[ "$ENABLE_MIXED_L4" == "true" ]]; then echo "    bind 127.0.0.1"; fi
   if [[ "$USE_WILDCARD" == "true" ]]; then
     echo "    tls {"
     echo "        dns cloudflare {env.CF_API_TOKEN}"
@@ -595,6 +692,12 @@ render_caddyfile() {
     echo
     echo "${http} {"
     echo "    import proxy"
+    echo "}"
+  elif [[ "$ENABLE_MIXED_L4" == "true" ]]; then
+    echo
+    echo "# https_port is internal, so redirects are written by hand and point to 443"
+    echo "${http} {"
+    echo "    redir https://{host}{uri} permanent"
     echo "}"
   fi
 }
@@ -674,7 +777,13 @@ show_routes() {
   else
     printf '\n  %sPort 80 :%s redirect → https\n' "$B" "$N"
   fi
-  printf '  %sPort 443:%s Caddy (TLS %s)\n' "$B" "$N" "$([[ "$USE_WILDCARD" == "true" ]] && echo "wildcard" || echo "per-host")"
+  if [[ "$ENABLE_MIXED_L4" == "true" ]]; then
+    printf '  %sPort 443:%s Caddy Layer 4 (by protocol)\n' "$B" "$N"
+    printf '    %-28s → 127.0.0.1:%s %s(Mixed/SOCKS/HTTP inbound)%s\n' "SOCKS5 / HTTP proxy" "$MIXED_PORT" "$D" "$N"
+    printf '    %-28s → 127.0.0.1:%s %s(Caddy HTTPS, %s)%s\n' "TLS / website / routes" "$CADDY_HTTPS_PORT" "$D" "$([[ "$USE_WILDCARD" == "true" ]] && echo "wildcard" || echo "per-host")" "$N"
+  else
+    printf '  %sPort 443:%s Caddy (TLS %s)\n' "$B" "$N" "$([[ "$USE_WILDCARD" == "true" ]] && echo "wildcard" || echo "per-host")"
+  fi
   for i in "${!LOC_KEYS[@]}"; do
     printf '    %-28s → [%-11s] 127.0.0.1:%s\n' "${LOC_KEYS[$i]}" "${LOC_TYPES[$i]}" "${LOC_PORTS[$i]}"
   done
@@ -690,6 +799,9 @@ show_xui_hint() {
   printf '\n  %s3x-ui reminders:%s\n' "$B" "$N"
   printf '    Inbounds : Listen 127.0.0.1 · Security none · transport = route type\n'
   printf '    Clients  : TLS on · port 443 · address/SNI/Host = your domain · path as listed\n'
+  if [[ "$ENABLE_MIXED_L4" == "true" ]]; then
+    printf '    Mixed    : inbound Listen 127.0.0.1, port %s (SOCKS+HTTP), set user/password; clients use server:443\n' "$MIXED_PORT"
+  fi
   printf '    gRPC     : serviceName = path without the leading "/"\n'
   printf '    Panel/Sub: panel without its own cert; its URI path must equal the route path\n'
 }
@@ -739,17 +851,19 @@ menu() {
   while true; do
     printf '\n  %s1)%s Add / Update route\n' "$B" "$N"
     printf '  %s2)%s Remove route\n' "$B" "$N"
-    printf '  %s3)%s Full reconfigure\n' "$B" "$N"
-    printf '  %s4)%s Show status\n' "$B" "$N"
-    printf '  %s5)%s Quit\n\n' "$B" "$N"
+    printf '  %s3)%s SOCKS5 / HTTP / Mixed on port 443 (on/off)\n' "$B" "$N"
+    printf '  %s4)%s Full reconfigure\n' "$B" "$N"
+    printf '  %s5)%s Show status\n' "$B" "$N"
+    printf '  %s6)%s Quit\n\n' "$B" "$N"
     choice="$(ask "Choose" "1")"
     case "$choice" in
       1) step "Add route"; show_routes; echo; prompt_locations; reapply; return 0 ;;
       2) step "Remove route"; remove_location; reapply; return 0 ;;
-      3) step "Full reconfigure"; gather_full; deploy; return 0 ;;
-      4) show_status ;;
-      5|q|Q) exit 0 ;;
-      *) err "Pick 1-5." ;;
+      3) step "SOCKS5 / HTTP / Mixed on 443"; configure_mixed; reapply; return 0 ;;
+      4) step "Full reconfigure"; gather_full; deploy; return 0 ;;
+      5) show_status ;;
+      6|q|Q) exit 0 ;;
+      *) err "Pick 1-6." ;;
     esac
   done
 }
