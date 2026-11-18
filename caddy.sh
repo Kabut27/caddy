@@ -10,11 +10,12 @@
 #            browsers         ─► camouflage website
 #
 #   v5.3.0: any custom SNI / Host from clients is accepted (fallback_sni + catch-all site)
+#   v5.4.0: real client IP forwarded to backends (X-Real-IP + X-Forwarded-For)
 #
 
 set -Eeuo pipefail
 
-readonly VERSION="5.3.0"
+readonly VERSION="5.4.0"
 readonly REPO_RAW="https://raw.githubusercontent.com/Kabut27/caddy/main"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly CADDY_ENV="/etc/caddy/caddy.env"
@@ -562,13 +563,10 @@ site_hosts() {
 }
 
 emit_proxy() {   # $1 upstream · $2 flush(true|false)
-  if [[ "$2" == "true" ]]; then
-    echo "        reverse_proxy $1 {"
-    echo "            flush_interval -1"
-    echo "        }"
-  else
-    echo "        reverse_proxy $1"
-  fi
+  echo "        reverse_proxy $1 {"
+  if [[ "$2" == "true" ]]; then echo "            flush_interval -1"; fi
+  echo "            header_up X-Real-IP {remote_host}"
+  echo "        }"
 }
 
 emit_fallback() {
@@ -817,6 +815,7 @@ show_xui_hint() {
   printf '\n  %s3x-ui reminders:%s\n' "$B" "$N"
   printf '    Inbounds : Listen 127.0.0.1 · Security none · transport = route type\n'
   printf '    Clients  : TLS on · port 443 · address = your domain · path as listed\n'
+  printf '    Real IP  : Caddy sends X-Forwarded-For + X-Real-IP; if your 3x-ui has sockopt trustedXForwardedFor, add X-Forwarded-For\n'
   printf '    Custom SNI: any SNI works (cert is for %s, so enable allowInsecure / pin the cert)\n' "$(base_domain)"
   if [[ "$ENABLE_MIXED_L4" == "true" ]]; then
     printf '    Mixed    : inbound Listen 127.0.0.1, port %s (SOCKS+HTTP), set user/password; clients use server:443\n' "$MIXED_PORT"
