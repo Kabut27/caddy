@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
 #
-# caddy.sh — automatic HTTPS reverse proxy powered by Caddy
-# Automatic HTTPS reverse proxy for 3x-ui / Xray behind a single domain.
+# caddy.sh — Caddy front (80 + 443) · Wildcard SSL (Cloudflare DNS) · 3x-ui / Xray backends
 #
-#   curl -fsSL https://raw.githubusercontent.com/Kabut27/caddy/main/caddy.sh -o caddy.sh
-#   sudo bash caddy.sh
+#   :80  ─► redirect to https (+ ACME HTTP-01 when no wildcard)
+#   :443 ─► Caddy terminates TLS (wildcard cert) and routes by subdomain or path:
+#            ws / httpupgrade ─► http://127.0.0.1:PORT   (Upgrade handled automatically)
+#            grpc / xhttp     ─► h2c://127.0.0.1:PORT    (HTTP/2 cleartext, no buffering)
+#            panel / sub      ─► http://127.0.0.1:PORT
+#            browsers         ─► camouflage website
 #
-# What it does:
-#   • Installs Caddy (official repo) and obtains/renews the TLS cert by itself
-#   • Routes /1../4 (or any path you choose) to your Xray inbounds on 127.0.0.1
-#   • Optional camouflage website for normal browsers
-#   • Re-run any time: add / remove locations without retyping anything
-#   • Validates every change and rolls back automatically on failure
-#
+
 set -Eeuo pipefail
 
-readonly VERSION="2.0.0"
+readonly VERSION="5.1.0"
 readonly REPO_RAW="https://raw.githubusercontent.com/Kabut27/caddy/main"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
+readonly CADDY_ENV="/etc/caddy/caddy.env"
 readonly STATE_DIR="/etc/caddy-deploy"
 readonly CONF_FILE="${STATE_DIR}/config.env"
 readonly LOC_FILE="${STATE_DIR}/locations.tsv"
 readonly BACKUP_DIR="${STATE_DIR}/backups"
-readonly LEGACY_STATE="/etc/nginx-deploy-state.sh"
 TS="$(date +%Y%m%d-%H%M%S)"
 readonly TS
 
@@ -45,14 +42,14 @@ trap 'err "Unexpected error on line ${LINENO}. Check the message above."' ERR
 banner() {
   printf '\n%s' "$B"
   cat <<'EOF'
-  ┌────────────────────────────────────────────────┐
-  │   Caddy Reverse Proxy  ·  3x-ui / Xray         │
-  └────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │   Caddy Front (80/443) + Wildcard SSL · 3x-ui / Xray     │
+  └──────────────────────────────────────────────────────────┘
 EOF
   printf '%s  %sv%s%s\n' "$N" "$D" "$VERSION" "$N"
 }
 
-ask() { # ask "prompt" "default" -> prints answer
+ask() {
   local prompt="$1" default="${2:-}" ans
   if [[ -n "$default" ]]; then
     read -r -p "  ${prompt} ${D}[${default}]${N}: " ans
@@ -63,7 +60,7 @@ ask() { # ask "prompt" "default" -> prints answer
   fi
 }
 
-confirm() { # confirm "prompt" "y|n"
+confirm() {
   local def="${2:-y}" hint ans
   if [[ "$def" == "y" ]]; then hint="Y/n"; else hint="y/N"; fi
   read -r -p "  $1 ${D}[${hint}]${N}: " ans
@@ -72,9 +69,9 @@ confirm() { # confirm "prompt" "y|n"
 }
 
 # ───────────────────────────── Validation ─────────────────────────────
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
-valid_host() { [[ "$1" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; }
-valid_path() { [[ "$1" =~ ^/[A-Za-z0-9._~/@:+-]+$ ]]; }
+valid_port()  { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_host()  { [[ "$1" =~ ^(\*\.)?([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; }
+valid_path()  { [[ "$1" =~ ^/[A-Za-z0-9._~/@:+-]+$ ]]; }
 valid_email() { [[ -z "$1" || "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
 
 normalize_path() {
@@ -85,15 +82,16 @@ normalize_path() {
 }
 
 # ───────────────────────────── State ─────────────────────────────
-declare -a HOSTS=() LOC_PATHS=() LOC_PORTS=()
+declare -a HOSTS=() LOC_KEYS=() LOC_PORTS=() LOC_TYPES=()
 DOMAINS=""
 EMAIL=""
-DEFAULT_PORT="10000"
+DEFAULT_PORT="10000"        # main backend at "/" (WS/HTTPUpgrade); empty = none
 ENABLE_FALLBACK="true"
 FALLBACK_DIR="/var/www/fallback"
-PLAIN_HTTP="false"
-LEGACY_DOMAIN=""
-LEGACY_PORT=""
+USE_WILDCARD="false"
+CF_API_TOKEN=""
+PLAIN_HTTP="false"          # also serve the same routes over plain HTTP on :80 (no TLS)
+NEED_RESTART="false"
 
 save_state() {
   local i
@@ -104,110 +102,146 @@ save_state() {
     printf 'DEFAULT_PORT=%q\n' "$DEFAULT_PORT"
     printf 'ENABLE_FALLBACK=%q\n' "$ENABLE_FALLBACK"
     printf 'FALLBACK_DIR=%q\n' "$FALLBACK_DIR"
+    printf 'USE_WILDCARD=%q\n' "$USE_WILDCARD"
+    printf 'CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
     printf 'PLAIN_HTTP=%q\n' "$PLAIN_HTTP"
   } > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
   : > "$LOC_FILE"
-  for i in "${!LOC_PATHS[@]}"; do
-    printf '%s\t%s\n' "${LOC_PATHS[$i]}" "${LOC_PORTS[$i]}" >> "$LOC_FILE"
+  for i in "${!LOC_KEYS[@]}"; do
+    printf '%s\t%s\t%s\n' "${LOC_KEYS[$i]}" "${LOC_PORTS[$i]}" "${LOC_TYPES[$i]}" >> "$LOC_FILE"
   done
 }
 
 load_state() {
-  local p q
+  local k q t
   # shellcheck disable=SC1090
   source "$CONF_FILE"
   read -ra HOSTS <<< "$DOMAINS"
-  LOC_PATHS=(); LOC_PORTS=()
+  LOC_KEYS=(); LOC_PORTS=(); LOC_TYPES=()
   if [[ -f "$LOC_FILE" ]]; then
-    while IFS=$'\t' read -r p q; do
-      if [[ -n "$p" && -n "$q" ]]; then LOC_PATHS+=("$p"); LOC_PORTS+=("$q"); fi
+    while IFS=$'\t' read -r k q t; do
+      if [[ -n "$k" && -n "$q" ]]; then LOC_KEYS+=("$k"); LOC_PORTS+=("$q"); LOC_TYPES+=("${t:-ws}"); fi
     done < "$LOC_FILE"
   fi
 }
 
-# Read domain / port / locations from the old nginx-based setup (read-only).
-import_legacy() {
-  local kind a b out
-  out="$(bash -c '
-    source "$1" 2>/dev/null || exit 0
-    printf "DOMAIN\t%s\t\n" "${DOMAIN:-}"
-    printf "PORT\t%s\t\n" "${DEFAULT_PORT:-}"
-    for i in "${!LOC_PATHS[@]}"; do printf "LOC\t%s\t%s\n" "${LOC_PATHS[$i]}" "${LOC_PORTS[$i]}"; done
-  ' _ "$LEGACY_STATE" 2>/dev/null || true)"
-  while IFS=$'\t' read -r kind a b; do
-    case "$kind" in
-      DOMAIN) LEGACY_DOMAIN="$a" ;;
-      PORT)   LEGACY_PORT="$a" ;;
-      LOC)
-        a="$(normalize_path "$a")"
-        if valid_path "$a" && valid_port "$b"; then add_location "$a" "$b" quiet; fi
-        ;;
-    esac
-  done <<< "$out"
+base_domain() { printf '%s' "${HOSTS[0]#\*.}"; }
+
+# ───────────────────────────── Routes (path or subdomain) ─────────────────────────────
+# A route key is either a path (/ws) or a full host (panel.example.com).
+normalize_key() {
+  local k="$1" base
+  base="$(base_domain)"
+  if [[ "$k" == /* ]]; then normalize_path "$k"; return 0; fi
+  k="${k,,}"; k="${k%.}"
+  [[ "$k" == *.* ]] || k="${k}.${base}"
+  printf '%s' "$k"
 }
 
-# ───────────────────────────── Locations ─────────────────────────────
-add_location() { # add_location path port [quiet]
-  local path port i
-  path="$(normalize_path "$1")"; port="$2"
-  for i in "${!LOC_PATHS[@]}"; do
-    if [[ "${LOC_PATHS[$i]}" == "$path" ]]; then
-      LOC_PORTS[$i]="$port"
-      [[ "${3:-}" == "quiet" ]] || info "${path} already existed — updated to 127.0.0.1:${port}"
+valid_key() {
+  local k="$1" base
+  base="$(base_domain)"
+  if [[ "$k" == /* ]]; then valid_path "$k"; return; fi
+  valid_host "$k" && [[ "$k" != \*.* && "$k" == *".${base}" ]]
+}
+
+ask_type() {
+  local c
+  {
+    printf '    %s1)%s WebSocket (ws)\n' "$B" "$N"
+    printf '    %s2)%s HTTPUpgrade\n' "$B" "$N"
+    printf '    %s3)%s gRPC            %s(h2c upstream)%s\n' "$B" "$N" "$D" "$N"
+    printf '    %s4)%s XHTTP / SplitHTTP %s(h2c upstream, no buffering)%s\n' "$B" "$N" "$D" "$N"
+    printf '    %s5)%s 3x-ui Panel / Subscription / other HTTP\n' "$B" "$N"
+  } >&2
+  while true; do
+    c="$(ask "Transport type" "1")"
+    case "$c" in
+      1) printf 'ws'; return 0 ;;
+      2) printf 'httpupgrade'; return 0 ;;
+      3) printf 'grpc'; return 0 ;;
+      4) printf 'xhttp'; return 0 ;;
+      5) printf 'http'; return 0 ;;
+      *) err "Pick 1-5." ;;
+    esac
+  done
+}
+
+add_location() {
+  local key="$1" port="$2" type="$3" i
+  for i in "${!LOC_KEYS[@]}"; do
+    if [[ "${LOC_KEYS[$i]}" == "$key" ]]; then
+      LOC_PORTS[$i]="$port"; LOC_TYPES[$i]="$type"
+      info "${key} updated → [${type}] 127.0.0.1:${port}"
       return 0
     fi
   done
-  LOC_PATHS+=("$path"); LOC_PORTS+=("$port")
-  [[ "${3:-}" == "quiet" ]] || ok "Added ${path} → 127.0.0.1:${port}"
+  LOC_KEYS+=("$key"); LOC_PORTS+=("$port"); LOC_TYPES+=("$type")
+  ok "Added ${key} → [${type}] 127.0.0.1:${port}"
 }
 
 prompt_locations() {
-  local p q
-  info "Add extra locations (e.g. your 3x-ui panel path, a websocket inbound…)."
-  info "Leave the path empty when you are done."
+  local k t q def base
+  base="$(base_domain)"
+  info "Add routes: a path (/ws, /panel) or a subdomain (panel → panel.${base})."
+  info "Leave it empty when you are done."
   while true; do
     echo
-    p="$(ask "Path (e.g. /panel or /ws)" "")"
-    if [[ -z "$p" ]]; then break; fi
-    p="$(normalize_path "$p")"
-    if ! valid_path "$p"; then err "Invalid path. Use letters, digits and . _ ~ / - only (and not just \"/\")."; continue; fi
-    q="$(ask "Backend port for ${p}" "")"
+    k="$(ask "Path or subdomain" "")"
+    if [[ -z "$k" ]]; then break; fi
+    k="$(normalize_key "$k")"
+    if ! valid_key "$k"; then err "Invalid path/subdomain (host must end with .${base})."; continue; fi
+    t="$(ask_type)"
+    case "$t" in http) def="2053" ;; *) def="10000" ;; esac
+    q="$(ask "Backend port for ${k} (127.0.0.1)" "$def")"
     if ! valid_port "$q"; then err "Invalid port."; continue; fi
-    add_location "$p" "$q"
+    add_location "$k" "$q" "$t"
   done
 }
 
 remove_location() {
   local i n
-  if (( ${#LOC_PATHS[@]} == 0 )); then warn "No locations to remove."; return 0; fi
-  for i in "${!LOC_PATHS[@]}"; do
-    printf '    %s%d)%s %s → 127.0.0.1:%s\n' "$B" "$((i + 1))" "$N" "${LOC_PATHS[$i]}" "${LOC_PORTS[$i]}"
+  if (( ${#LOC_KEYS[@]} == 0 )); then warn "No extra routes to remove."; return 0; fi
+  for i in "${!LOC_KEYS[@]}"; do
+    printf '    %s%d)%s %s → [%s] 127.0.0.1:%s\n' "$B" "$((i + 1))" "$N" "${LOC_KEYS[$i]}" "${LOC_TYPES[$i]}" "${LOC_PORTS[$i]}"
   done
   n="$(ask "Number to remove (blank to cancel)" "")"
-  if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#LOC_PATHS[@]} )); then
+  if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#LOC_KEYS[@]} )); then
     n=$((n - 1))
-    ok "Removed ${LOC_PATHS[$n]}"
-    unset 'LOC_PATHS[n]' 'LOC_PORTS[n]'
-    LOC_PATHS=("${LOC_PATHS[@]}"); LOC_PORTS=("${LOC_PORTS[@]}")
-  else
-    info "Nothing removed."
+    ok "Removed ${LOC_KEYS[$n]}"
+    unset 'LOC_KEYS[n]' 'LOC_PORTS[n]' 'LOC_TYPES[n]'
+    LOC_KEYS=("${LOC_KEYS[@]}"); LOC_PORTS=("${LOC_PORTS[@]}"); LOC_TYPES=("${LOC_TYPES[@]}")
   fi
 }
 
 # ───────────────────────────── Questions ─────────────────────────────
 ask_domains() {
-  local input host good
+  local input host good base_dom
   while true; do
-    input="$(ask "Domain(s), space separated" "${1:-}")"
+    input="$(ask "Base Domain (e.g. example.com)" "${1:-example.com}")"
     input="${input//,/ }"; input="${input,,}"
     read -ra HOSTS <<< "$input"
     good=true
     (( ${#HOSTS[@]} > 0 )) || good=false
     for host in "${HOSTS[@]}"; do
-      if ! valid_host "$host"; then err "\"${host}\" is not a valid domain (use e.g. vpn.example.com)."; good=false; fi
+      if ! valid_host "$host"; then err "\"${host}\" is not a valid domain."; good=false; fi
     done
     if [[ "$good" == "true" ]]; then break; fi
   done
+
+  if confirm "Enable Wildcard Certificate (*.${HOSTS[0]#\*.}) via Cloudflare DNS API?" "y"; then
+    USE_WILDCARD="true"
+    base_dom="${HOSTS[0]#\*.}"
+    HOSTS=("$base_dom" "*.${base_dom}")
+    while true; do
+      CF_API_TOKEN="$(ask "Cloudflare API Token (Zone:DNS:Edit)" "$CF_API_TOKEN")"
+      if [[ -n "$CF_API_TOKEN" ]]; then break; fi
+      err "Cloudflare API Token is required for wildcard certificates."
+    done
+  else
+    USE_WILDCARD="false"
+  fi
   DOMAINS="${HOSTS[*]}"
 }
 
@@ -221,42 +255,34 @@ ask_email() {
 }
 
 gather_full() {
-  local def_domain="${LEGACY_DOMAIN:-example.com}" def_port="${LEGACY_PORT:-10000}" ans
+  local ans
 
-  step "1/4  Domain & certificate"
-  info "Caddy requests and renews the certificate automatically (Let's Encrypt)."
-  info "Point your domain's A/AAAA record to this server first. DNS-only (grey cloud) is simplest."
-  ask_domains "$def_domain"
-  ask_email ""
+  step "1/4  Domain & Wildcard SSL"
+  ask_domains "${HOSTS[0]:-example.com}"
+  ask_email "$EMAIL"
 
-  step "2/4  Default backend"
-  info "Any path not listed below goes to your main VLESS/HTTPUpgrade inbound."
+  step "2/4  Main backend at /  (WebSocket / HTTPUpgrade)"
+  info "Requests with an Upgrade header on any other path go to this inbound. 0 = none."
   while true; do
-    ans="$(ask "Default backend port" "$def_port")"
+    ans="$(ask "Main backend port (127.0.0.1)" "$DEFAULT_PORT")"
+    if [[ "$ans" == "0" ]]; then DEFAULT_PORT=""; break; fi
     if valid_port "$ans"; then DEFAULT_PORT="$ans"; break; fi
     err "Invalid port."
   done
+
   if confirm "Also accept plain HTTP on port 80 for proxy clients (no TLS)?" "n"; then PLAIN_HTTP="true"; else PLAIN_HTTP="false"; fi
 
-  step "3/4  Camouflage website"
-  info "Normal browsers get a real-looking site; your VLESS/HTTPUpgrade clients are unaffected."
-  if confirm "Enable the camouflage website?" "y"; then
+  step "3/4  Routes (ws · httpupgrade · grpc · xhttp · panel · sub)"
+  LOC_KEYS=(); LOC_PORTS=(); LOC_TYPES=()
+  prompt_locations
+
+  step "4/4  Camouflage Website"
+  if confirm "Enable the camouflage website for normal browsers?" "y"; then
     ENABLE_FALLBACK="true"
     FALLBACK_DIR="$(ask "Directory to serve it from" "$FALLBACK_DIR")"
   else
     ENABLE_FALLBACK="false"
   fi
-
-  step "4/4  Locations"
-  if (( ${#LOC_PATHS[@]} > 0 )); then
-    info "Imported from your previous setup:"
-    local i
-    for i in "${!LOC_PATHS[@]}"; do info "  ${LOC_PATHS[$i]} → 127.0.0.1:${LOC_PORTS[$i]}"; done
-  elif confirm "Quick-add standard paths /1→10001, /2→10002, /3→10003, /4→10004?" "y"; then
-    local n
-    for n in 1 2 3 4; do add_location "/${n}" "$((10000 + n))"; done
-  fi
-  prompt_locations
 }
 
 # ───────────────────────────── System preparation ─────────────────────────────
@@ -266,45 +292,96 @@ require_apt()  { command -v apt-get >/dev/null 2>&1 || die "This script supports
 free_ports() {
   local busy
   if systemctl is-active --quiet nginx 2>/dev/null; then
-    warn "nginx is running and uses ports 80/443 (Caddy replaces it)."
-    if confirm "Stop and disable nginx now? (its config files are kept)" "y"; then
+    warn "nginx is running on 80/443."
+    if confirm "Stop and disable nginx now?" "y"; then
       systemctl disable --now nginx >/dev/null 2>&1 || true
       ok "nginx stopped and disabled."
     fi
   fi
   busy="$(ss -H -ltnp '( sport = :80 or sport = :443 )' 2>/dev/null | grep -v '"caddy"' || true)"
   if [[ -n "$busy" ]]; then
-    err "Ports 80/443 are still in use by another program:"
+    err "Ports 80/443 are currently in use by another program:"
     printf '%s\n' "$busy" | sed 's/^/      /' >&2
-    die "Free those ports and re-run."
+    die "Move that inbound in 3x-ui to Listen 127.0.0.1 + a local port (Security: none), restart x-ui, then re-run."
   fi
+}
+
+# Prebuilt Caddy with plugins from the official download service (no Go needed).
+#   caddy-dns/cloudflare → wildcard certificates (DNS-01)
+#   caddy-l4             → layer4 (TCP/UDP) proxying; not used by the config below, kept for later
+fetch_custom_caddy() {
+  local arch url tmp
+  case "$(uname -m)" in
+    x86_64|amd64)  arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) return 1 ;;
+  esac
+  url="https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/cloudflare&p=github.com/mholt/caddy-l4"
+  tmp="$(mktemp)"
+  if curl -fsSL "$url" -o "$tmp" && chmod +x "$tmp" \
+     && "$tmp" list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
+    install_custom_binary "$tmp"
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Keep the custom binary safe from `apt upgrade` overwriting it.
+install_custom_binary() {
+  local bin="$1"
+  systemctl stop caddy 2>/dev/null || true
+  if [[ -z "$(dpkg-divert --list /usr/bin/caddy 2>/dev/null)" ]]; then
+    dpkg-divert --divert /usr/bin/caddy.default --rename /usr/bin/caddy >/dev/null
+  fi
+  install -m 755 "$bin" /usr/bin/caddy.custom
+  update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.custom 50 >/dev/null
+}
+
+build_with_xcaddy() {
+  local tmp_bin
+  warn "Prebuilt download failed — falling back to xcaddy (needs a recent Go)."
+  if ! command -v xcaddy >/dev/null 2>&1; then
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/gpg.key' \
+      | gpg --dearmor --yes -o /usr/share/keyrings/caddy-xcaddy-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/xcaddy/debian.deb.txt' \
+      -o /etc/apt/sources.list.d/caddy-xcaddy.list
+    apt-get update -qq
+    apt-get install -y -qq xcaddy golang-go >/dev/null
+  fi
+  tmp_bin="$(mktemp -d)"
+  (
+    cd "$tmp_bin"
+    xcaddy build \
+      --with github.com/caddy-dns/cloudflare \
+      --with github.com/mholt/caddy-l4
+  )
+  install_custom_binary "${tmp_bin}/caddy"
+  rm -rf "$tmp_bin"
 }
 
 install_caddy() {
-  if command -v caddy >/dev/null 2>&1; then
-    ok "Caddy already installed ($(caddy version | awk '{print $1}'))."
-    return 0
-  fi
-  info "Installing Caddy from the official repository…"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq apt-transport-https ca-certificates curl gpg >/dev/null
-  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
-    | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-    -o /etc/apt/sources.list.d/caddy-stable.list
-  chmod 644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
-  apt-get update -qq
-  apt-get install -y -qq caddy >/dev/null
-  ok "Caddy installed ($(caddy version | awk '{print $1}'))."
-}
+  if ! command -v caddy >/dev/null 2>&1; then
+    info "Installing official Caddy package & systemd service…"
+    apt-get update -qq
+    apt-get install -y -qq apt-transport-https ca-certificates curl gpg debian-keyring debian-archive-keyring >/dev/null
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+      | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+      -o /etc/apt/sources.list.d/caddy-stable.list
+    chmod 644 /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq
+    apt-get install -y -qq caddy >/dev/null
+  fi
 
-open_firewall() {
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow 80/tcp  >/dev/null
-    ufw allow 443/tcp >/dev/null
-    ufw allow 443/udp >/dev/null
-    ok "ufw: opened 80/tcp, 443/tcp, 443/udp."
+  if [[ "$USE_WILDCARD" == "true" ]] && ! caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
+    info "Getting Caddy with cloudflare-dns (+ caddy-l4) plugins…"
+    if ! fetch_custom_caddy; then build_with_xcaddy; fi
+    ok "Caddy ready with Cloudflare DNS module."
+  else
+    ok "Caddy binary ready ($(caddy version | awk '{print $1}'))."
   fi
 }
 
@@ -312,6 +389,7 @@ check_dns() {
   local host srv_ip dns_ip mismatch=false
   srv_ip="$(curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
   for host in "${HOSTS[@]}"; do
+    if [[ "$host" == \*.* ]]; then continue; fi
     dns_ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}' || true)"
     if [[ -z "$dns_ip" ]]; then
       warn "${host} has no A record yet."; mismatch=true
@@ -321,9 +399,60 @@ check_dns() {
       ok "DNS looks good: ${host} → ${dns_ip}"
     fi
   done
-  if [[ "$mismatch" == "true" ]]; then
-    confirm "Certificate issuance may fail. Continue anyway?" "n" || die "Fix DNS and re-run."
+  if [[ "$USE_WILDCARD" == "true" ]]; then
+    info "Wildcard cert needs no A record, but subdomain routes do (add an A record for *.$(base_domain) → this server)."
   fi
+  if [[ "$mismatch" == "true" ]]; then
+    confirm "Certificate issuance / access may fail. Continue anyway?" "n" || die "Fix DNS and re-run."
+  fi
+}
+
+open_firewall() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow 80/tcp  >/dev/null
+    ufw allow 443/tcp >/dev/null
+    ufw allow 443/udp >/dev/null   # HTTP/3 (QUIC)
+    ok "ufw: opened 80/tcp, 443/tcp, 443/udp."
+  fi
+}
+
+# Cloudflare token lives in an env file (not in the Caddyfile).
+setup_caddy_env() {
+  [[ "$USE_WILDCARD" == "true" ]] || return 0
+  local new="CF_API_TOKEN=${CF_API_TOKEN}" unit="/etc/systemd/system/caddy.service.d/10-env.conf"
+  mkdir -p /etc/caddy /etc/systemd/system/caddy.service.d
+  if [[ ! -f "$CADDY_ENV" || "$(cat "$CADDY_ENV")" != "$new" ]]; then
+    ( umask 077; printf '%s\n' "$new" > "$CADDY_ENV" )
+    chmod 600 "$CADDY_ENV"
+    NEED_RESTART="true"
+  fi
+  if [[ ! -f "$unit" ]]; then
+    cat > "$unit" <<'UNIT'
+[Service]
+EnvironmentFile=/etc/caddy/caddy.env
+UNIT
+    systemctl daemon-reload
+    NEED_RESTART="true"
+  fi
+}
+
+# Make sure Caddy starts before Xray / 3x-ui at boot.
+setup_boot_order() {
+  local svc dir found=false
+  for svc in x-ui xray; do
+    if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "^${svc}\.service"; then
+      dir="/etc/systemd/system/${svc}.service.d"
+      mkdir -p "$dir"
+      cat > "${dir}/10-after-caddy.conf" <<'UNIT'
+[Unit]
+After=caddy.service
+Wants=caddy.service
+UNIT
+      ok "${svc}.service will now start after caddy.service."
+      found=true
+    fi
+  done
+  if [[ "$found" == "true" ]]; then systemctl daemon-reload; else info "x-ui/xray service not found — boot order skipped."; fi
 }
 
 setup_fallback() {
@@ -349,9 +478,44 @@ HTML
 }
 
 # ───────────────────────────── Caddyfile ─────────────────────────────
+# Hosts Caddy must serve. Without a wildcard, every subdomain route gets its own cert.
+site_hosts() {
+  local k h seen
+  local -a out=("${HOSTS[@]}")
+  if [[ "$USE_WILDCARD" != "true" ]]; then
+    for k in "${LOC_KEYS[@]}"; do
+      if [[ "$k" == /* ]]; then continue; fi
+      seen=false
+      for h in "${out[@]}"; do
+        if [[ "$h" == "$k" ]]; then seen=true; fi
+      done
+      if [[ "$seen" == "false" ]]; then out+=("$k"); fi
+    done
+  fi
+  printf '%s\n' "${out[@]}"
+}
+
+emit_proxy() {   # $1 upstream · $2 flush(true|false)
+  if [[ "$2" == "true" ]]; then
+    echo "        reverse_proxy $1 {"
+    echo "            flush_interval -1"
+    echo "        }"
+  else
+    echo "        reverse_proxy $1"
+  fi
+}
+
+emit_fallback() {
+  echo "        root * ${FALLBACK_DIR}"
+  echo "        rewrite * /index.html"
+  echo "        file_server"
+}
+
 render_caddyfile() {
-  local h https="" http="" i
-  for h in "${HOSTS[@]}"; do
+  local h https="" http="" i key port type upstream flush
+  local -a sites=()
+  mapfile -t sites < <(site_hosts)
+  for h in "${sites[@]}"; do
     https+="${https:+, }${h}"
     http+="${http:+, }http://${h}"
   done
@@ -370,37 +534,63 @@ render_caddyfile() {
   echo "(proxy) {"
   echo "    header -Server"
   echo
-  for i in "${!LOC_PATHS[@]}"; do
-    echo "    @loc${i} path ${LOC_PATHS[$i]} ${LOC_PATHS[$i]}/*"
-    echo "    handle @loc${i} {"
-    echo "        reverse_proxy 127.0.0.1:${LOC_PORTS[$i]} {"
-    echo "            flush_interval -1"
-    echo "        }"
+
+  for i in "${!LOC_KEYS[@]}"; do
+    key="${LOC_KEYS[$i]}"; port="${LOC_PORTS[$i]}"; type="${LOC_TYPES[$i]}"
+    case "$type" in
+      grpc|xhttp)      upstream="h2c://127.0.0.1:${port}"; flush="true" ;;
+      ws|httpupgrade)  upstream="127.0.0.1:${port}";       flush="true" ;;
+      *)               upstream="127.0.0.1:${port}";       flush="false" ;;
+    esac
+    if [[ "$key" == /* ]]; then
+      echo "    @r${i} path ${key} ${key}/*"
+    else
+      echo "    @r${i} host ${key}"
+    fi
+    echo "    handle @r${i} {"
+    emit_proxy "$upstream" "$flush"
     echo "    }"
     echo
   done
-  if [[ "$ENABLE_FALLBACK" == "true" ]]; then
+
+  if [[ "$ENABLE_FALLBACK" == "true" && -n "$DEFAULT_PORT" ]]; then
     echo "    @browser {"
     echo "        not header Upgrade *"
     echo "    }"
     echo "    handle @browser {"
-    echo "        root * ${FALLBACK_DIR}"
-    echo "        rewrite * /index.html"
-    echo "        file_server"
+    emit_fallback
     echo "    }"
-    echo
+    echo "    handle {"
+    echo "        rewrite * /"
+    emit_proxy "127.0.0.1:${DEFAULT_PORT}" "true"
+    echo "    }"
+  elif [[ "$ENABLE_FALLBACK" == "true" ]]; then
+    echo "    handle {"
+    emit_fallback
+    echo "    }"
+  elif [[ -n "$DEFAULT_PORT" ]]; then
+    echo "    handle {"
+    echo "        rewrite * /"
+    emit_proxy "127.0.0.1:${DEFAULT_PORT}" "true"
+    echo "    }"
+  else
+    echo "    handle {"
+    echo "        respond 404"
+    echo "    }"
   fi
-  echo "    handle {"
-  echo "        rewrite * /"
-  echo "        reverse_proxy 127.0.0.1:${DEFAULT_PORT} {"
-  echo "            flush_interval -1"
-  echo "        }"
-  echo "    }"
   echo "}"
   echo
+
   echo "${https} {"
+  if [[ "$USE_WILDCARD" == "true" ]]; then
+    echo "    tls {"
+    echo "        dns cloudflare {env.CF_API_TOKEN}"
+    echo "        resolvers 1.1.1.1 8.8.8.8"
+    echo "    }"
+  fi
   echo "    import proxy"
   echo "}"
+
   if [[ "$PLAIN_HTTP" == "true" ]]; then
     echo
     echo "${http} {"
@@ -415,6 +605,7 @@ apply_config() {
   render_caddyfile > "$tmp"
   caddy fmt --overwrite "$tmp" >/dev/null 2>&1 || true
 
+  if [[ "$USE_WILDCARD" == "true" ]]; then export CF_API_TOKEN; fi
   if ! caddy validate --config "$tmp" --adapter caddyfile >/dev/null 2>"${tmp}.err"; then
     err "Caddy rejected the generated config:"
     sed 's/^/      /' "${tmp}.err" >&2
@@ -427,12 +618,18 @@ apply_config() {
     backup="${BACKUP_DIR}/Caddyfile.${TS}.bak"
     cp "$CADDYFILE" "$backup"
   fi
-  install -m 644 "$tmp" "$CADDYFILE"
+  install -m 600 "$tmp" "$CADDYFILE"
+  chown caddy:caddy "$CADDYFILE" 2>/dev/null || true
   rm -f "$tmp" "${tmp}.err"
 
+  setup_caddy_env
   systemctl enable caddy >/dev/null 2>&1 || true
   if systemctl is-active --quiet caddy; then
-    systemctl reload caddy || { rollback "$backup"; return 1; }
+    if [[ "$NEED_RESTART" == "true" ]]; then
+      systemctl restart caddy || { rollback "$backup"; return 1; }
+    else
+      systemctl reload caddy || systemctl restart caddy || { rollback "$backup"; return 1; }
+    fi
   else
     systemctl start caddy || { rollback "$backup"; return 1; }
   fi
@@ -453,7 +650,9 @@ rollback() {
 }
 
 verify_https() {
-  local host="${HOSTS[0]}" tries=0
+  local host
+  host="$(base_domain)"
+  local tries=0
   info "Waiting for the certificate for ${host} (up to ~60s)…"
   while (( tries < 12 )); do
     if curl -sS -o /dev/null --max-time 8 "https://${host}/" 2>/dev/null; then
@@ -470,33 +669,48 @@ verify_https() {
 # ───────────────────────────── Views ─────────────────────────────
 show_routes() {
   local i
-  printf '\n  %sRoutes%s\n' "$B" "$N"
-  for i in "${!LOC_PATHS[@]}"; do
-    printf '    %-22s → 127.0.0.1:%s\n' "${LOC_PATHS[$i]}" "${LOC_PORTS[$i]}"
+  if [[ "$PLAIN_HTTP" == "true" ]]; then
+    printf '\n  %sPort 80 :%s same routes over plain HTTP (no TLS)\n' "$B" "$N"
+  else
+    printf '\n  %sPort 80 :%s redirect → https\n' "$B" "$N"
+  fi
+  printf '  %sPort 443:%s Caddy (TLS %s)\n' "$B" "$N" "$([[ "$USE_WILDCARD" == "true" ]] && echo "wildcard" || echo "per-host")"
+  for i in "${!LOC_KEYS[@]}"; do
+    printf '    %-28s → [%-11s] 127.0.0.1:%s\n' "${LOC_KEYS[$i]}" "${LOC_TYPES[$i]}" "${LOC_PORTS[$i]}"
   done
-  printf '    %-22s → 127.0.0.1:%s  %s(catch-all)%s\n' "/" "$DEFAULT_PORT" "$D" "$N"
+  if [[ -n "$DEFAULT_PORT" ]]; then
+    printf '    %-28s → [ws/upgrade ] 127.0.0.1:%s  %s(Upgrade requests)%s\n' "/" "$DEFAULT_PORT" "$D" "$N"
+  fi
+  if [[ "$ENABLE_FALLBACK" == "true" ]]; then
+    printf '    %-28s → camouflage site %s(%s)%s\n' "browsers" "$D" "$FALLBACK_DIR" "$N"
+  fi
+}
+
+show_xui_hint() {
+  printf '\n  %s3x-ui reminders:%s\n' "$B" "$N"
+  printf '    Inbounds : Listen 127.0.0.1 · Security none · transport = route type\n'
+  printf '    Clients  : TLS on · port 443 · address/SNI/Host = your domain · path as listed\n'
+  printf '    gRPC     : serviceName = path without the leading "/"\n'
+  printf '    Panel/Sub: panel without its own cert; its URI path must equal the route path\n'
 }
 
 summary() {
   printf '\n%s━━━ Done ━━━%s\n' "$B$G" "$N"
   printf '  Domain(s):   %s\n' "$DOMAINS"
-  printf '  TLS:         automatic (Caddy)\n'
-  if [[ "$ENABLE_FALLBACK" == "true" ]]; then printf '  Camouflage:  %s\n' "$FALLBACK_DIR"; fi
+  printf '  Wildcard:    %s\n' "$USE_WILDCARD"
   show_routes
-  printf '\n  %sTip:%s set each Xray inbound / the 3x-ui panel to listen on 127.0.0.1\n' "$B" "$N"
-  printf '       so nothing can reach them while bypassing Caddy.\n'
-  printf '  %sConfig:%s %s   %sBackups:%s %s\n\n' "$B" "$N" "$CADDYFILE" "$B" "$N" "$BACKUP_DIR"
+  show_xui_hint
+  printf '\n  %sConfig:%s %s\n\n' "$B" "$N" "$CADDYFILE"
 }
 
 show_status() {
   step "Status"
-  printf '  Caddy:    %s (%s)\n' "$(systemctl is-active caddy 2>/dev/null || true)" "$(caddy version 2>/dev/null | awk '{print $1}')"
+  printf '  Caddy:     %s (%s)\n' "$(systemctl is-active caddy 2>/dev/null || true)" "$(caddy version 2>/dev/null | awk '{print $1}')"
   printf '  Domain(s): %s\n' "$DOMAINS"
   show_routes
   echo
 }
 
-# ───────────────────────────── Flows ─────────────────────────────
 deploy() {
   step "Preparing the server"
   check_dns
@@ -504,8 +718,9 @@ deploy() {
   install_caddy
   open_firewall
   setup_fallback
+  setup_boot_order
   step "Applying configuration"
-  apply_config || die "Deployment aborted. Nothing was changed on the running service."
+  apply_config || die "Deployment aborted."
   save_state
   verify_https
   summary
@@ -513,6 +728,7 @@ deploy() {
 
 reapply() {
   step "Applying configuration"
+  install_caddy
   apply_config || die "Aborted. Previous configuration is still active."
   save_state
   summary
@@ -521,15 +737,15 @@ reapply() {
 menu() {
   local choice
   while true; do
-    printf '\n  %s1)%s Add location(s)\n' "$B" "$N"
-    printf '  %s2)%s Remove a location\n' "$B" "$N"
-    printf '  %s3)%s Full reconfigure (domain, ports, camouflage…)\n' "$B" "$N"
+    printf '\n  %s1)%s Add / Update route\n' "$B" "$N"
+    printf '  %s2)%s Remove route\n' "$B" "$N"
+    printf '  %s3)%s Full reconfigure\n' "$B" "$N"
     printf '  %s4)%s Show status\n' "$B" "$N"
     printf '  %s5)%s Quit\n\n' "$B" "$N"
     choice="$(ask "Choose" "1")"
     case "$choice" in
-      1) step "Add locations"; show_routes; echo; prompt_locations; reapply; return 0 ;;
-      2) step "Remove a location"; remove_location; reapply; return 0 ;;
+      1) step "Add route"; show_routes; echo; prompt_locations; reapply; return 0 ;;
+      2) step "Remove route"; remove_location; reapply; return 0 ;;
       3) step "Full reconfigure"; gather_full; deploy; return 0 ;;
       4) show_status ;;
       5|q|Q) exit 0 ;;
@@ -553,13 +769,6 @@ main() {
     return 0
   fi
 
-  if [[ -f "$LEGACY_STATE" ]]; then
-    info "Found a previous nginx setup."
-    if confirm "Import its domain and locations?" "y"; then
-      import_legacy
-      ok "Imported ${#LOC_PATHS[@]} location(s)."
-    fi
-  fi
   gather_full
   deploy
 }
