@@ -25,6 +25,9 @@
 #           · Cloudflare token is masked; systemd drop-in tolerates a missing env file
 #           · safer self-update (syntax check, never downgrades), single-instance lock,
 #             dependency check, apt lock wait, SSL days-left, live health in the final summary
+#   v5.7.1: REALITY SNI list accepts wildcards (*.example.com) so every subdomain reaches the inbound
+#   v5.7.2: typing just www.example.com offers to route all its subdomains automatically
+#   v5.7.3: subdomains are added automatically (no question): www.example.com → + *.example.com + example.com
 #
 
 set -Eeuo pipefail
@@ -34,7 +37,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
   exit 1
 fi
 
-readonly VERSION="5.7.0"
+readonly VERSION="5.7.3"
 readonly REPO_RAW="https://raw.githubusercontent.com/Kabut27/caddy/main"
 readonly CADDYFILE="/etc/caddy/Caddyfile"
 readonly CADDY_ENV="/etc/caddy/caddy.env"
@@ -186,6 +189,15 @@ base_domain() { printf '%s' "${HOSTS[0]#\*.}"; }
 
 # caddy-l4 fronts :443 when SOCKS/HTTP/Mixed and/or REALITY is enabled.
 use_l4() { [[ "$ENABLE_MIXED_L4" == "true" || "$ENABLE_REALITY" == "true" ]]; }
+
+# Exact (non-wildcard) names from the REALITY SNI list — these are the ones Xray's serverNames needs.
+reality_exact_names() {
+  local n out=""
+  for n in $REALITY_SNIS; do
+    [[ "$n" == \** ]] || out+="${out:+ }${n}"
+  done
+  printf '%s' "$out"
+}
 
 # Check if a port is already assigned to another role in our config.
 # $1 = port, $2 = role to ignore (default|mixed|https|reality|loc:<key>)
@@ -388,7 +400,7 @@ configure_mixed() {
 
 # $1 = previous on/off value used for the default answer (defaults to the current setting)
 configure_reality() {
-  local ans def="n" pp_def="n" s base good conflict prev="${1:-$ENABLE_REALITY}"
+  local ans def="n" pp_def="n" s base good conflict suffix apex need_exp out="" prev="${1:-$ENABLE_REALITY}"
   local -a list=()
   base="$(base_domain)"
   [[ "$prev" == "true" ]] && def="y"
@@ -396,6 +408,7 @@ configure_reality() {
   info "REALITY (VLESS + Vision) on port 443: connections whose SNI matches your chosen site(s) go to a REALITY inbound."
   info "Everything else (your website, WS routes, custom SNI) keeps working as now."
   info "Pick a real, popular HTTPS site (TLS 1.3 + h2) as SNI/dest — NOT your own domain."
+  info "Type just the site (e.g. www.example.com): all its subdomains are routed to REALITY automatically."
   if confirm "Enable REALITY on port 443?" "$def"; then
     ENABLE_REALITY="true"
     while true; do
@@ -408,14 +421,43 @@ configure_reality() {
       ans="$(ask "REALITY SNI / dest site(s), space separated (e.g. www.example.com)" "$REALITY_SNIS")"
       ans="${ans//,/ }"; ans="${ans,,}"
       read -ra list <<< "$ans"
+
+      # Typed an exact site (e.g. www.microsoft.com)? Automatically cover all its subdomains too.
+      need_exp=false
+      for s in "${list[@]}"; do
+        [[ "$s" == \*.* ]] && continue
+        apex="${s#www.}"
+        [[ " ${list[*]} " == *" *.${apex} "* ]] || need_exp=true
+      done
+      if [[ "$need_exp" == "true" ]]; then
+        for s in "${list[@]}"; do
+          [[ "$s" == \*.* ]] && continue
+          apex="${s#www.}"
+          list+=("*.${apex}" "$apex")
+        done
+        info "All subdomains are included automatically (*.name + the bare name)."
+      fi
+
       good=true
       (( ${#list[@]} > 0 )) || good=false
       for s in "${list[@]}"; do
-        if [[ "$s" == \*.* ]]; then err "\"${s}\" cannot be a wildcard — use an exact hostname."; good=false
-        elif ! valid_host "$s"; then err "\"${s}\" is not a valid domain."; good=false
-        elif [[ "$s" == "$base" || "$s" == *".${base}" ]]; then err "\"${s}\" belongs to your own domain — use another site."; good=false; fi
+        suffix="${s#\*.}"
+        if ! valid_host "$s"; then err "\"${s}\" is not a valid domain."; good=false
+        elif [[ "$suffix" == "$base" || "$suffix" == *".${base}" ]]; then err "\"${s}\" belongs to your own domain — use another site."; good=false
+        elif [[ "$s" == \*.* && "$base" == *".${suffix}" ]]; then err "\"${s}\" would also capture your own domain (${base}) — use another site."; good=false; fi
       done
-      if [[ "$good" == "true" ]]; then REALITY_SNIS="${list[*]}"; break; fi
+      if [[ "$good" == "true" ]]; then
+        out=""
+        for s in "${list[@]}"; do
+          [[ " ${out} " == *" ${s} "* ]] || out+="${out:+ }${s}"
+          if [[ "$s" == \*.* ]]; then
+            suffix="${s#\*.}"
+            [[ " ${out} " == *" ${suffix} "* ]] || out+=" ${suffix}"
+          fi
+        done
+        REALITY_SNIS="$out"
+        break
+      fi
     done
     info "If you answer yes below, enable 'Proxy Protocol' (sockopt acceptProxyProtocol) on that inbound in 3x-ui, otherwise it will not connect."
     if confirm "Send PROXY protocol (real client IP) to the REALITY inbound?" "$pp_def"; then
@@ -1085,13 +1127,19 @@ show_routes() {
 }
 
 show_xui_hint() {
+  local REALITY_EXACT=""
+  [[ "$ENABLE_REALITY" == "true" ]] && REALITY_EXACT="$(reality_exact_names)"
   printf '\n  %s3x-ui reminders:%s\n' "$B" "$N"
   printf '    Inbounds : Listen 127.0.0.1 · Security none · transport = route type\n'
   printf '    Clients  : TLS on · port 443 · address = your domain · path as listed\n'
   printf '    Real IP  : Caddy sends X-Forwarded-For + X-Real-IP; if your 3x-ui has sockopt trustedXForwardedFor, add X-Forwarded-For\n'
   printf '    Custom SNI: any SNI works (cert is for %s, so enable allowInsecure / pin the cert)\n' "$(base_domain)"
   if [[ "$ENABLE_REALITY" == "true" ]]; then
-    printf '    REALITY  : inbound Listen 127.0.0.1 · port %s · TCP (RAW) · Security reality · dest = <SNI>:443 · serverNames = %s\n' "$REALITY_PORT" "$REALITY_SNIS"
+    printf '    REALITY  : inbound Listen 127.0.0.1 · port %s · TCP (RAW) · Security reality · dest = <SNI>:443 · serverNames = %s\n' "$REALITY_PORT" "${REALITY_EXACT:-<the exact names you will use>}"
+    if [[ "$REALITY_SNIS" == *"*."* ]]; then
+      printf '               Xray does NOT support wildcards in serverNames: add every exact name you use (e.g. www.x.com, beta.x.com)\n'
+      printf '               in the inbound SNI field. Caddy already sends all of: %s\n' "$REALITY_SNIS"
+    fi
     printf '               flow xtls-rprx-vision · client: port 443, address = your domain or server IP, sni = one of the SNIs, fp chrome, publicKey + shortId\n'
     if [[ "$REALITY_PROXY_PROTO" == "true" ]]; then
       printf '               enable Proxy Protocol (sockopt acceptProxyProtocol) on that inbound\n'
